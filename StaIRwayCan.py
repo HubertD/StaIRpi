@@ -1,104 +1,104 @@
-from LightBarrier import LightBarrier
-from Observable import Observable
-from config import NUM_STEPS, MAX_LEDS_PER_STEP
-
 import can
-import copy
+
+from Observable import Observable
+from LightBarrier import LightBarrier
+from config import NUM_STEPS, MAX_LEDS_PER_STEP, STEPS_PER_CONTROLLER
+from config import CAN_BASE_ID, CAN_BASE_MASK, CAN_FUNCTION_MASK
+from config import CAN_ID_BARRIER_STATUS, CAN_ID_SET_LED, CAN_ID_SET_ALL_LEDS, CAN_ID_UPDATE_LEDS
+
 
 class StaIRwayCan:
 
     def __init__(self, device):
-        self.bus = can.interface.Bus(channel=device, bustype="socketcan_native")
+        can_filters = [{'can_id': self.make_can_id(0, CAN_ID_BARRIER_STATUS), 'can_mask': CAN_FUNCTION_MASK}]
+        self.bus = can.interface.Bus(channel=device, bustype="socketcan_native", can_filters=can_filters)
         self.barriers = [LightBarrier() for _ in range(NUM_STEPS)]
         self.leds = [([0] * MAX_LEDS_PER_STEP) for _ in range(NUM_STEPS)]
-        self.leds_shadow = copy.deepcopy(self.leds)
         self.OnStepStatusChanged = Observable()
-        self.flush_msg = can.Message(arbitration_id=0x1339FF05, extended_id=True, data=[0xFF])
-        self.setall_msg = can.Message(arbitration_id=0x1339FF04, extended_id=True, data=[0xFF, 0, 0, 0])
+        self.msg_set_led = can.Message(arbitration_id=self.make_can_id_all(CAN_ID_SET_ALL_LEDS), extended_id=True, data=[0, 0, 0, 0, 0])
+        self.msg_set_step = can.Message(arbitration_id=self.make_can_id_all(CAN_ID_SET_ALL_LEDS), extended_id=True, data=[0xFF, 0, 0, 0])
+        self.msg_set_all = can.Message(arbitration_id=self.make_can_id_all(CAN_ID_SET_ALL_LEDS), extended_id=True, data=[0xFF, 0, 0, 0])
+        self.msg_flush = can.Message(arbitration_id=self.make_can_id_all(CAN_ID_UPDATE_LEDS), extended_id=True, data=[0xFF])
 
     def poll(self, max_delay=0.1):
         msg = self.bus.recv(max_delay)
         while msg is not None:
-            self.process_message(msg)
+            self.process_can_message(msg)
             msg = self.bus.recv(0)
 
-    def process_message(self, msg):
+    def process_can_message(self, msg):
         id = msg.arbitration_id
-        if id & 0x1FFF0000 != 0x13390000:
+        if id & CAN_BASE_MASK != CAN_BASE_ID:
             return
 
         device_mask = (id >> 8) & 0xFF
         function_id = id & 0xFF
-        for i in range(8):
-            if (device_mask & (1<<i)) == 0:
-                continue
-            if function_id == 2:
-                self.process_barrier_status(i, msg.data[0])
+
+        if function_id == CAN_ID_BARRIER_STATUS:
+            for i in range(8):
+                if (device_mask & (1 << i)) != 0:
+                    self.process_barrier_status(i, msg.data[0])
 
     def process_barrier_status(self, device_id, status_byte):
-        self.set_step_status(3 * device_id + 0, (status_byte & 0x01) != 0)
-        self.set_step_status(3 * device_id + 1, (status_byte & 0x02) != 0)
-        self.set_step_status(3 * device_id + 2, (status_byte & 0x04) != 0)
+        for i in range(STEPS_PER_CONTROLLER):
+            self.update_step_status(STEPS_PER_CONTROLLER * device_id + i, (status_byte & (1 << i)) != 0)
 
-    def set_step_status(self, step_id, status):
+    def update_step_status(self, step_id, status):
         has_changed = self.barriers[step_id].set_active(status)
         if has_changed:
             self.OnStepStatusChanged.fire(step=step_id, status=status)
 
-    def set_led(self, step, led, color):
-        self.leds[step][led] = color
+    def set_led_color(self, step_id, led_id, color):
+        if self.leds[step_id][led_id] != color:
+            r, g, b = self.make_rgb(color)
+            self.msg_set_led.data = [0, led_id, r, g, b]
+            self.set_can_addr(self.msg_set_led, step_id, CAN_ID_SET_LED)
+            self.send_can_message(self.msg_set_led)
+            self.leds[step_id][led_id] = color
 
-    def set_step_color(self, step, color):
-        self.send_step_color(step, color)
+    def set_step_color(self, step_id, color):
+        r, g, b = self.make_rgb(color)
+        self.msg_set_step.data = [0, r, g, b]
+        self.set_can_addr(self.msg_set_step, step_id, CAN_ID_SET_ALL_LEDS)
+        self.send_can_message(self.msg_set_step)
+        for led_id, k in enumerate(self.leds[step_id]):
+            self.leds[step_id][led_id] = color
 
     def set_all_color(self, color):
-        self.send_all_color(color)
-
-    def update_leds(self):
-        for step_id, stepdata in enumerate(self.leds):
-            for (led_id, color) in enumerate(stepdata):
-                if self.leds_shadow[step_id][led_id] != color:
-                    self.send_led_color(step_id, led_id, color)
-        self.send_flush_leds()
-
-    def send_led_color(self, step_id, led_id, color):
         r, g, b = self.make_rgb(color)
-        msg = can.Message(arbitration_id=self.make_can_id(step_id)+3, extended_id=True, data=[self.make_step_mask(step_id), led_id, r, g, b])
-        self.bus.send(msg)
-        self.leds_shadow[step_id][led_id] = color
-
-    def send_step_color(self, step_id, color):
-        r, g, b = self.make_rgb(color)
-        msg = can.Message(arbitration_id=self.make_can_id(step_id)+4, extended_id=True, data=[self.make_step_mask(step_id), r, g, b])
-        self.bus.send(msg)
-        for led_id, k in enumerate(self.leds_shadow[step_id]):
-            self.leds[step_id][led_id] = color
-            self.leds_shadow[step_id][led_id] = color
-
-    def send_all_color(self, color):
-        r, g, b = self.make_rgb(color)
-        self.setall_msg.data[1] = r
-        self.setall_msg.data[2] = g
-        self.setall_msg.data[3] = b
-        self.bus.send(self.setall_msg)
-        print(self.setall_msg)
+        self.msg_set_all.data = [0xFF, r, g, b]
+        self.send_can_message(self.msg_set_all)
         for step_id, _ in enumerate(self.leds):
             for led_id, _ in enumerate(self.leds[step_id]):
                 self.leds[step_id][led_id] = color
-                self.leds_shadow[step_id][led_id] = color
 
-    def make_can_id(self, step_id):
-        device_id = int(step_id / 3)
-        return 0x13390000 | ((1 << device_id) << 8)
+    def update_leds(self):
+        self.send_can_message(self.msg_flush)
 
-    def make_step_mask(self, step_id):
-        return 1 << (step_id % 3)
+    def send_can_message(self, msg):
+        self.bus.send(msg)
 
-    def make_rgb(self, color):
-        r = (color>>16) & 0xFF
-        g = (color>>8) & 0xFF
+    @staticmethod
+    def make_can_id(step_id, function_id=0):
+        device_id = int(step_id / STEPS_PER_CONTROLLER)
+        return CAN_BASE_ID | ((1 << device_id) << 8) | function_id
+
+    @staticmethod
+    def make_can_id_all(function_id=0):
+        return CAN_BASE_ID | 0xFF00 | function_id
+
+    @staticmethod
+    def make_step_mask(step_id) -> object:
+        return 1 << (step_id % STEPS_PER_CONTROLLER)
+
+    @staticmethod
+    def set_can_addr(msg, step_id, function_id):
+        msg.arbitration_id = StaIRwayCan.make_can_id(step_id, function_id)
+        msg.data[0] = StaIRwayCan.make_step_mask(step_id)
+
+    @staticmethod
+    def make_rgb(color):
+        r = (color >> 16) & 0xFF
+        g = (color >> 8) & 0xFF
         b = color & 0xFF
         return r, g, b
-
-    def send_flush_leds(self):
-        self.bus.send(self.flush_msg)
