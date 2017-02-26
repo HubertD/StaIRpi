@@ -44,11 +44,20 @@ class StaIRwayCan:
             self.update_step_status(STEPS_PER_CONTROLLER * device_id + i, (status_byte & (1 << i)) != 0)
 
     def update_step_status(self, step_id, status):
+        if (step_id < 0) or (step_id > NUM_STEPS):
+            return
         has_changed = self.barriers[step_id].set_active(status)
         if has_changed:
             self.OnStepStatusChanged.fire(step=step_id, status=status)
 
+    def get_step_status(self, step_id):
+        if (step_id < 0) or (step_id > NUM_STEPS):
+            return False
+        return self.barriers[step_id].get_status()
+
     def set_led_color(self, step_id, led_id, color):
+        if (step_id < 0) or (step_id >= NUM_STEPS) or (led_id < 0) or (led_id >= MAX_LEDS_PER_STEP):
+            return
         if self.leds[step_id][led_id] != color:
             r, g, b = self.make_rgb(color)
             self.msg_set_led.data = [0, led_id, r, g, b]
@@ -57,6 +66,8 @@ class StaIRwayCan:
             self.leds[step_id][led_id] = color
 
     def set_step_color(self, step_id, color):
+        if (step_id < 0) or (step_id >= NUM_STEPS):
+            return
         r, g, b = self.make_rgb(color)
         self.msg_set_step.data = [0, r, g, b]
         self.set_can_addr(self.msg_set_step, step_id, CAN_ID_SET_ALL_LEDS)
