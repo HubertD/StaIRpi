@@ -1,0 +1,10 @@
+[Unit]
+Description=StaIRway Controller
+After=multi-user.target
+
+[Service]
+Type=idle
+ExecStart=/usr/bin/python3 /home/pi/StaIRpi/StaIRpi.py
+
+[Install]
+WantedBy=multi-user.target
