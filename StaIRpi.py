@@ -1,106 +1,61 @@
-import can
-from datetime import datetime
+import re
 import paho.mqtt.client as mqtt
+from StaIRwayCan import StaIRwayCan
+from config import NUM_STEPS, MAX_LEDS_PER_STEP
 
-
-class LightBarrier:
-
+class StaIRpi:
     def __init__(self):
-        self.is_active = False
-        self.t_last_active = None
+        self.mqttc = mqtt.Client()
+        self.mqttc.on_message = self.on_mqtt_message
+        self.swcan = StaIRwayCan("can0")
 
-    def set_active(self, is_active):
-        was_active = self.is_active
-        self.is_active = is_active
-        if is_active:
-            self.t_last_active = datetime.now()
-        return was_active != is_active
+        self.re_setled = re.compile(r'StaIRwaY\/led\/(\d+)\/(\d+)\/color')
+        self.re_setledstep = re.compile(r'StaIRwaY\/led\/(\d+)\/color')
 
-    def get_status(self):
-        return self.is_active
+    def run(self):
+        self.mqttc.connect("localhost", 1883, 60)
+        self.mqttc.subscribe("StaIRwaY/led/#")
+        self.mqttc.subscribe("StaIRwaY/auto")
+        self.mqttc.loop_start()
+        self.swcan.OnStepStatusChanged.subscribe(lambda e: self.send_mqtt_barrier_status(e.step, e.status))
 
-    def seconds_since_last_active(self):
-        if self.t_last_active is None:
-            return None
-        else:
-            interval = datetime.now() - self.t_last_active
-            return interval.total_seconds()
+        while True:
+            self.swcan.poll(0)
+            """
+            for step_id in range(NUM_STEPS):
+                r = range(MAX_LEDS_PER_STEP)
+                if (step_id%2)==1:
+                    r = reversed(r)
+                for led_id in r:
+                    self.swcan.set_led(step_id, led_id, 0xFF0000)
+                    self.swcan.update_leds()
+                    self.swcan.poll(0.01)
+                    self.swcan.set_led(step_id, led_id, 0x000000)
+            """
 
+    def send_mqtt_barrier_status(self, step_id, status):
+        self.mqttc.publish("StaIRwaY/barrier/" + str(step_id) + "/active", status)
 
-NUM_STAIRS = 18
-bus = can.interface.Bus(channel="can0", bustype="socketcan_native")
-barriers = [LightBarrier() for i in range(NUM_STAIRS)]
-step_colors = [0x000000] * NUM_STAIRS
-last_led_update = datetime.now()
+    def on_mqtt_message(self, client, userdata, message):
 
-mqttc = mqtt.Client()
+        if message.topic == "StaIRwaY/led/color":
+            self.swcan.set_all_color(self.parse_color(message.payload))
+            self.swcan.update_leds()
+            return
 
-def main():
-    mqttc.connect("localhost", 1883, 60)
-    mqttc.loop_start()
+        obj = re.match(self.re_setled, message.topic)
+        if obj:
+            self.swcan.set_led(int(obj.group(1)), int(obj.group(2)), self.parse_color(message.payload))
+            self.swcan.update_leds()
+            return
 
-    while True:
-        msg = bus.recv(0.1)
-        while msg is not None:
-            process_message(msg)
-            msg = bus.recv(0)
-        update_ledstrips()
+        obj = re.match(self.re_setledstep, message.topic)
+        if obj:
+            self.swcan.set_step_color(int(obj.group(1)), self.parse_color(message.payload))
+            self.swcan.update_leds()
+            return
 
-def process_message(msg):
-    id = msg.arbitration_id
+    def parse_color(self, str):
+        return int(str, 16)
 
-    if id & 0x1FFF0000 != 0x13390000:
-        return
-
-    device_mask = (id >> 8) & 0xFF
-    function_id = id & 0xFF
-    for i in range(8):
-        if (device_mask & (1<<i)) == 0:
-            continue
-        if function_id == 2:
-            process_barrier_status(i, msg.data[0])
-
-def process_barrier_status(device_id, status_byte):
-    set_step_status(3 * device_id + 0, (status_byte & 0x01) != 0)
-    set_step_status(3 * device_id + 1, (status_byte & 0x02) != 0)
-    set_step_status(3 * device_id + 2, (status_byte & 0x04) != 0)
-
-def set_step_status(step_id, status):
-    has_changed = barriers[step_id].set_active(status)
-    if has_changed:
-        mqttc.publish("StaIRwaY/steps/"+str(step_id)+"/active", status)
-
-def calc_step_colors():
-    for i in range(NUM_STAIRS):
-        t = barriers[i].seconds_since_last_active()
-        if (t is None) or (t>0.15):
-            step_colors[i] = 0x00FF00
-        else:
-            step_colors[i] = 0xFF0000
-
-def update_ledstrips():
-    global last_led_update
-
-    last_led_update = datetime.now()
-    calc_step_colors()
-
-    for i in range(len(step_colors)):
-        color = step_colors[i]
-        send_step_color(i, (color >> 16) & 0xFF, (color >> 8) & 0xFF, (color >> 0) & 0xFF)
-    send_flush_leds()
-
-def send_all_off():
-    msg = can.Message(arbitration_id=0x1339FF04, extended_id=True, data=[0xFF, 0, 0, 0])
-    bus.send(msg)
-
-def send_step_color(step_id, r, g, b):
-    device_id = (int)(step_id / 3)
-    device_mask = (1 << device_id)
-    msg = can.Message(arbitration_id=0x13390004 | (device_mask << 8), extended_id=True, data=[1 << (step_id % 3), r, g, b])
-    bus.send(msg)
-
-def send_flush_leds():
-    msg = can.Message(arbitration_id=0x1339FF05, extended_id=True, data=[0xFF])
-    bus.send(msg)
-
-main()
+StaIRpi().run()
